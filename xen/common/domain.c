@@ -117,6 +117,9 @@ struct vcpu *alloc_vcpu(
     if ( (v = alloc_vcpu_struct()) == NULL )
         return NULL;
 
+	// Jeongseob
+	v->is_stacked = 0;
+
     v->domain = d;
     v->vcpu_id = vcpu_id;
 
@@ -203,6 +206,10 @@ struct domain *domain_create(
 
     if ( (d = alloc_domain_struct()) == NULL )
         return ERR_PTR(-ENOMEM);
+
+	// Jeongseob
+    spin_lock_init(&d->ple_lock);
+	d->on_PLE = 0;
 
     d->domain_id = domid;
 

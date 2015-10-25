@@ -81,6 +81,8 @@ struct waitqueue_vcpu;
 
 struct vcpu 
 {
+	//Jeongseob
+	bool_t			is_stacked;
     int              vcpu_id;
 
     int              processor;
@@ -224,6 +226,10 @@ struct mem_event_per_domain
 
 struct domain
 {
+	// Jeongseob
+	spinlock_t		ple_lock;
+	bool_t			on_PLE;
+
     domid_t          domain_id;
 
     shared_info_t   *shared_info;     /* shared data area */

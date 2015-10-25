@@ -187,6 +187,8 @@ struct scheduler {
 
     void         (*tick_suspend)    (const struct scheduler *, unsigned int);
     void         (*tick_resume)     (const struct scheduler *, unsigned int);
+	
+    void         (*set_urgent)      (const struct scheduler *, struct vcpu *);
 };
 
 extern const struct scheduler sched_sedf_def;

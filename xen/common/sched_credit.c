@@ -49,6 +49,7 @@
 /*
  * Priorities
  */
+#define CSCHED_PRI_TS_TURBO_BOOST      1     
 #define CSCHED_PRI_TS_BOOST      0      /* time-share waking up */
 #define CSCHED_PRI_TS_UNDER     -1      /* time-share w/ credits */
 #define CSCHED_PRI_TS_OVER      -2      /* time-share w/o credits */
@@ -60,6 +61,7 @@
  */
 #define CSCHED_FLAG_VCPU_PARKED    0x0  /* VCPU over capped credits */
 #define CSCHED_FLAG_VCPU_YIELD     0x1  /* VCPU yielding */
+#define CSCHED_FLAG_VCPU_URGENT    0x2  /* VCPU urgent */
 
 
 /*
@@ -126,6 +128,7 @@ struct csched_pcpu {
  * Virtual CPU
  */
 struct csched_vcpu {
+
     struct list_head runq_elem;
     struct list_head active_vcpu_elem;
     struct csched_dom *sdom;
@@ -623,6 +626,10 @@ csched_vcpu_acct(struct csched_private *prv, unsigned int cpu)
     if ( svc->pri == CSCHED_PRI_TS_BOOST )
         svc->pri = CSCHED_PRI_TS_UNDER;
 
+	// Jeongseob
+	if ( svc->pri == CSCHED_PRI_TS_TURBO_BOOST )
+		svc->pri = CSCHED_PRI_TS_UNDER;
+
     /*
      * Update credits
      */
@@ -670,6 +677,7 @@ csched_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
         CSCHED_PRI_IDLE : CSCHED_PRI_TS_UNDER;
     CSCHED_VCPU_STATS_RESET(svc);
     CSCHED_STAT_CRANK(vcpu_init);
+	
     return svc;
 }
 
@@ -775,15 +783,36 @@ csched_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
      * after earning credits they had overspent. We don't boost
      * those.
      */
+	
+	// Jeongseob	
+	if ( svc->pri == CSCHED_PRI_TS_UNDER &&
+		test_and_clear_bit(CSCHED_FLAG_VCPU_URGENT, &svc->flags) )
+	{
+		// printk("[Dom-%d] vCPU[%d:%d:%d] Turbo boosting !! \n", svc->vcpu->domain->domain_id, svc->vcpu->vcpu_id, svc->vcpu->processor, svc->pri);
+		svc->pri = CSCHED_PRI_TS_TURBO_BOOST;
+		perfc_incra(turbo_boost, svc->sdom->dom->domain_id);
+
+	}
+
     if ( svc->pri == CSCHED_PRI_TS_UNDER &&
          !test_bit(CSCHED_FLAG_VCPU_PARKED, &svc->flags) )
     {
         svc->pri = CSCHED_PRI_TS_BOOST;
+		perfc_incra(boost, svc->sdom->dom->domain_id);
     }
+
 
     /* Put the VCPU on the runq and tickle CPUs */
     __runq_insert(cpu, svc);
     __runq_tickle(cpu, svc);
+}
+
+// Jeongseob	
+static void
+csched_vcpu_urgent(const struct scheduler *ops, struct vcpu *vc)
+{
+    struct csched_vcpu * const svc = CSCHED_VCPU(vc);
+    set_bit(CSCHED_FLAG_VCPU_URGENT, &svc->flags);
 }
 
 static void
@@ -1358,6 +1387,29 @@ csched_schedule(
         scurr->pri = CSCHED_PRI_IDLE;
     }
 
+	// Jeongseob
+	if ( scurr->pri == CSCHED_PRI_TS_TURBO_BOOST )
+		scurr->pri = CSCHED_PRI_TS_UNDER;
+	
+	/*
+	{
+    	int credit;
+	
+		//clear_bit(CSCHED_FLAG_VCPU_URGENT, &scurr->flags);
+		credit = atomic_read(&scurr->credit);
+
+		if ( credit < 0 ) 
+		{
+			scurr->pri = CSCHED_PRI_TS_OVER;
+		}
+		else
+		{
+			scurr->pri = CSCHED_PRI_TS_UNDER;
+		}
+	}
+	*/
+
+
     /* Choices, choices:
      * - If we have a tasklet, we need to run the idle vcpu no matter what.
      * - If sched rate limiting is in effect, and the current vcpu has
@@ -1385,6 +1437,7 @@ csched_schedule(
         ret.migrated = 0;
         goto out;
     }
+
     tslice = MILLISECS(prv->tslice_ms);
 
     /*
@@ -1409,6 +1462,7 @@ csched_schedule(
      * Clear YIELD flag before scheduling out
      */
     clear_bit(CSCHED_FLAG_VCPU_YIELD, &scurr->flags);
+	
 
     /*
      * SMP Load balance:
@@ -1440,13 +1494,17 @@ csched_schedule(
     if ( !is_idle_vcpu(snext->vcpu) )
         snext->start_time += now;
 
+	// Jeongseob
+	if (snext->pri == CSCHED_PRI_TS_TURBO_BOOST)
+		tslice = MILLISECS(1);
+
 out:
     /*
      * Return task to run next...
      */
     ret.time = (is_idle_vcpu(snext->vcpu) ?
                 -1 : tslice);
-    ret.task = snext->vcpu;
+	ret.task = snext->vcpu;
 
     CSCHED_VCPU_CHECK(ret.task);
     return ret;
@@ -1706,4 +1764,7 @@ const struct scheduler sched_credit_def = {
 
     .tick_suspend   = csched_tick_suspend,
     .tick_resume    = csched_tick_resume,
+
+	// Jeongseob
+	.set_urgent		= csched_vcpu_urgent,
 };

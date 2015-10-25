@@ -4,8 +4,8 @@
 # 'make clean' before rebuilding.
 #
 verbose       ?= n
-perfc         ?= n
-perfc_arrays  ?= n
+perfc         ?= y
+perfc_arrays  ?= y
 lock_profile  ?= n
 crash_debug   ?= n
 frame_pointer ?= n

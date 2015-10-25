@@ -9,6 +9,7 @@ PERFCOUNTER_ARRAY(hypercalls,           "hypercalls", NR_hypercalls)
 PERFCOUNTER(calls_to_multicall,         "calls to multicall")
 PERFCOUNTER(calls_from_multicall,       "calls from multicall")
 
+PERFCOUNTER_ARRAY(do_yield,			"# yields", 5)
 PERFCOUNTER(irqs,                   "#interrupts")
 PERFCOUNTER(ipis,                   "#IPIs")
 
@@ -51,6 +52,11 @@ PERFCOUNTER(dom_destroy,            "csched: dom_destroy")
 PERFCOUNTER(vcpu_init,              "csched: vcpu_init")
 PERFCOUNTER(vcpu_destroy,           "csched: vcpu_destroy")
 PERFCOUNTER(vcpu_hot,               "csched: vcpu_hot")
+// Jeoengseob
+PERFCOUNTER_ARRAY(vcpu_stack,		"csched: vcpu_stack", 4)
+PERFCOUNTER_ARRAY(turbo_boost,		"csched: turbo_boost", 5)
+PERFCOUNTER_ARRAY(boost,			"csched: boost", 5)
+PERFCOUNTER(dummy,					"csched: dummy")
 
 PERFCOUNTER(need_flush_tlb_flush,   "PG_need_flush tlb flushes")
 

@@ -518,6 +518,115 @@ static void vcpu_migrate(struct vcpu *v)
     vcpu_wake(v);
 }
 
+static void vcpu_migrate_to_designated_cpu(struct vcpu *v, int dest_cpu)
+{
+	unsigned long flags;
+    unsigned int old_cpu, new_cpu;
+    spinlock_t *old_lock, *new_lock;
+    bool_t pick_called = 0;
+
+    old_cpu = new_cpu = v->processor;
+    for ( ; ; )
+    {
+        old_lock = per_cpu(schedule_data, old_cpu).schedule_lock;
+        new_lock = per_cpu(schedule_data, new_cpu).schedule_lock;
+
+        if ( old_lock == new_lock )
+        {
+            spin_lock_irqsave(old_lock, flags);
+        }
+        else if ( old_lock < new_lock )
+        {
+            spin_lock_irqsave(old_lock, flags);
+            spin_lock(new_lock);
+        }
+        else
+        {
+            spin_lock_irqsave(new_lock, flags);
+            spin_lock(old_lock);
+        }
+
+        old_cpu = v->processor;
+        if ( old_lock == per_cpu(schedule_data, old_cpu).schedule_lock )
+        {
+            /*
+             * If we selected a CPU on the previosu iteration, check if it
+             * remains suitable for running this vCPU.
+             */
+            if ( pick_called &&
+                 (new_lock == per_cpu(schedule_data, new_cpu).schedule_lock) &&
+                 cpumask_test_cpu(new_cpu, v->cpu_affinity) &&
+                 cpumask_test_cpu(new_cpu, v->domain->cpupool->cpu_valid) )
+                break;
+
+            /* Select a new CPU. */
+            new_cpu = dest_cpu;
+            if ( (new_lock == per_cpu(schedule_data, new_cpu).schedule_lock) &&
+                 cpumask_test_cpu(new_cpu, v->domain->cpupool->cpu_valid) )
+                break;
+            pick_called = 1;
+        }
+        else
+        {
+            /*
+             * We do not hold the scheduler lock appropriate for this vCPU.
+             * Thus we cannot select a new CPU on this iteration. Try again.
+             */
+            pick_called = 0;
+        }
+
+        if ( old_lock != new_lock )
+            spin_unlock(new_lock);
+        spin_unlock_irqrestore(old_lock, flags);
+    }
+
+    /*
+     * NB. Check of v->running happens /after/ setting migration flag
+     * because they both happen in (different) spinlock regions, and those
+     * regions are strictly serialised.
+     */
+    if ( v->is_running ||
+         !test_and_clear_bit(_VPF_migrating, &v->pause_flags) )
+    {
+        if ( old_lock != new_lock )
+            spin_unlock(new_lock);
+        spin_unlock_irqrestore(old_lock, flags);
+        return;
+    }
+
+    /*
+     * Transfer urgency status to new CPU before switching CPUs, as once
+     * the switch occurs, v->is_urgent is no longer protected by the per-CPU
+     * scheduler lock we are holding.
+     */
+    if ( unlikely(v->is_urgent) && (old_cpu != new_cpu) )
+    {
+        atomic_inc(&per_cpu(schedule_data, new_cpu).urgent_count);
+        atomic_dec(&per_cpu(schedule_data, old_cpu).urgent_count);
+    }
+
+    /*
+     * Switch to new CPU, then unlock new and old CPU.  This is safe because
+     * the lock pointer cant' change while the current lock is held.
+     */
+    if ( VCPU2OP(v)->migrate )
+        SCHED_OP(VCPU2OP(v), migrate, v, new_cpu);
+    else
+        v->processor = new_cpu;
+
+
+    if ( old_lock != new_lock )
+        spin_unlock(new_lock);
+    spin_unlock_irqrestore(old_lock, flags);
+
+    if ( old_cpu != new_cpu )
+        evtchn_move_pirqs(v);
+
+    /* Wake on new CPU. */
+    vcpu_wake(v);
+
+}
+
 /*
  * Force a VCPU through a deschedule/reschedule path.
  * For example, using this when setting the periodic timer period means that
@@ -761,17 +870,185 @@ static long do_poll(struct sched_poll *sched_poll)
     return rc;
 }
 
+int sched_cosched_domain(struct domain *d)
+{
+	struct vcpu * v;
+    cpumask_t usable_cpumask, tmp_cpumask, nonusable_cpumask;
+	cpumask_t running_cpumask;
+	int dest_cpu = -1;
+	int num_stacked = 0;
+	int prev_cpu = -1;
+
+	// TODO: add timestamp
+	spin_lock(&d->ple_lock);
+	if ( d->on_PLE )
+	{
+		spin_unlock(&d->ple_lock);
+		return -1;
+	}
+	else
+		d->on_PLE = 1;
+	spin_unlock(&d->ple_lock);
+
+#ifdef JSDEBUG
+	printk("[Dom-%d] current [%d:%d]\n", d->domain_id, current->vcpu_id, current->processor);
+#endif
+	cpumask_clear(&running_cpumask);
+
+#ifdef JSDEBUG
+	printk(" Running vcpus: \n");
+#endif
+	for_each_vcpu(d, v) 
+	{
+		vcpu_schedule_lock_irq(v);
+		if ( v->is_running ) 
+		{
+			cpumask_set_cpu(v->processor, &running_cpumask);
+#ifdef JSDEBUG
+			printk("\t[%d:%d]\n", v->vcpu_id, v->processor);
+#endif
+			vcpu_schedule_unlock_irq(v);
+		}
+		else
+		{
+			vcpu_schedule_unlock_irq(v);
+		}
+	}
+
+#ifdef JSDEBUG
+	printk(" Non-running vcpus: \n");
+#endif
+				
+	cpumask_copy(&nonusable_cpumask, &running_cpumask);
+
+	for_each_vcpu(d, v)
+	{
+		if ( v == current ) 
+			continue;
+
+		vcpu_schedule_lock_irq(v);
+		if ( !v->is_running && vcpu_runnable(v) )
+		{
+			if ( cpumask_test_cpu(v->processor, &nonusable_cpumask) )
+			{
+				v->is_stacked = 1;
+				vcpu_schedule_unlock_irq(v);
+				num_stacked ++ ;
+#ifdef JSDEBUG
+				printk("\t[%d:%d]-stacked\n", v->vcpu_id, v->processor);
+#endif
+			}
+			else
+			{
+				// Tickling the vCPU to run (pri: TURBO_BOOST)
+				SCHED_OP(VCPU2OP(v), set_urgent, v);
+				set_bit(_VPF_migrating, &v->pause_flags);
+				vcpu_schedule_unlock_irq(v);
+				vcpu_sleep_nosync(v);
+
+				vcpu_schedule_lock_irq(v);
+				clear_bit(_VPF_migrating, &v->pause_flags);
+				cpumask_set_cpu(v->processor, &nonusable_cpumask);
+				vcpu_schedule_unlock_irq(v);
+#ifdef JSDEBUG
+				printk("\t[%d:%d]-wake\n", v->vcpu_id, v->processor);
+#endif
+				vcpu_wake(v);
+			}
+		}
+		else
+		{
+			vcpu_schedule_unlock_irq(v);
+		}
+	}
+	
+	perfc_incra(vcpu_stack, num_stacked);
+
+	if ( num_stacked > 0 ) 
+	{
+		for_each_vcpu(d, v)
+		{
+			vcpu_schedule_lock_irq(v);
+
+			if ( v->is_stacked ) 
+			{
+				prev_cpu = v->processor;
+				vcpu_schedule_unlock_irq(v);
+
+				cpumask_complement(&tmp_cpumask, &nonusable_cpumask);
+				cpumask_and(&usable_cpumask, &tmp_cpumask, v->cpu_affinity);
+				dest_cpu = cpumask_first(&usable_cpumask);
+
+				vcpu_schedule_lock_irq(v);
+				if ( dest_cpu == prev_cpu || !cpumask_test_cpu(dest_cpu, v->cpu_affinity)  )
+				{
+					perfc_incr(dummy);
+#ifdef JSDEBUG
+					printk("ERROR [%d:%d]-stacked [%d->%d]\n", v->vcpu_id, prev_cpu, prev_cpu, dest_cpu);
+#endif
+					SCHED_OP(VCPU2OP(v), set_urgent, v);
+					set_bit(_VPF_migrating, &v->pause_flags);
+					v->is_stacked = 0;
+					vcpu_schedule_unlock_irq(v);
+					vcpu_sleep_nosync(v);
+
+					vcpu_schedule_lock_irq(v);
+					clear_bit(_VPF_migrating, &v->pause_flags);
+					vcpu_schedule_unlock_irq(v);
+					vcpu_wake(v);
+				}
+				else
+				{
+					SCHED_OP(VCPU2OP(v), set_urgent, v);
+					set_bit(_VPF_migrating, &v->pause_flags);
+					v->is_stacked = 0;
+					cpumask_set_cpu(dest_cpu, &nonusable_cpumask);
+					vcpu_schedule_unlock_irq(v);
+					
+					vcpu_sleep_nosync(v);
+					vcpu_migrate_to_designated_cpu(v, dest_cpu);
+				}
+			}
+			else
+			{
+				vcpu_schedule_unlock_irq(v);
+			}
+		}
+	}
+	
+	spin_lock(&d->ple_lock);
+	d->on_PLE = 0;
+	spin_unlock(&d->ple_lock);
+
+	return 0;
+}
+
 /* Voluntarily yield the processor for this allocation. */
 static long do_yield(void)
 {
     struct vcpu * v=current;
 
-    vcpu_schedule_lock_irq(v);
-    SCHED_OP(VCPU2OP(v), yield, v);
-    vcpu_schedule_unlock_irq(v);
-
-    TRACE_2D(TRC_SCHED_YIELD, current->domain->domain_id, current->vcpu_id);
-    raise_softirq(SCHEDULE_SOFTIRQ);
+	// Jeongseob
+	if ( v->domain->domain_id != 0)
+	{
+		sched_cosched_domain(v->domain);
+		
+		// Added by Jeongseob
+		if (current->domain->domain_id != DOMID_IDLE)
+		{
+			perfc_incra(do_yield, current->domain->domain_id);
+		}
+	} 
+	else
+	{
+		vcpu_schedule_lock_irq(v);
+		SCHED_OP(VCPU2OP(v), yield, v);
+		vcpu_schedule_unlock_irq(v);
+		
+		TRACE_2D(TRC_SCHED_YIELD, current->domain->domain_id, current->vcpu_id);
+		raise_softirq(SCHEDULE_SOFTIRQ);
+	}
+    
     return 0;
 }
 
